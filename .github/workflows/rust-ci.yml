@@ -3,7 +3,7 @@ name: Builds and tests
 on:
   push:
     branches:
-      - master
+      - NewArc
   pull_request:
 
 jobs:

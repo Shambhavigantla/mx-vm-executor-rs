@@ -3,7 +3,7 @@ name: libvmexeccapi-build
 on:
   push:
     branches:
-      - master
+      - NewArc
   pull_request:
 
 env:
