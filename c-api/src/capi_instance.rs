@@ -1,22 +1,30 @@
 //! Instantiate a module, call functions, and read exports.
 
 use crate::{
-    capi_executor::{CapiExecutor, vm_exec_executor_t},
-    service_singleton::with_service,
+    capi_executor::vm_exec_executor_t, handle_registry, service_singleton::with_service,
     string_copy, vm_exec_result_t,
 };
 use libc::{c_char, c_int};
 use meta::capi_safe_unwind;
 use multiversx_chain_vm_executor::{CompilationOptionsLegacy, InstanceLegacy};
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::slice;
+use std::sync::{Condvar, Mutex};
+use std::thread::{self, ThreadId};
 
 /// Maximum bytes scanned when converting a C-string function-name
 /// pointer into a Rust `&str`. Wasm function names in real contracts
 /// are 4-32 chars; 1024 is generous and bounds the worst-case scan if
 /// the C caller violates the null-terminator contract.
 const MAX_C_FUNC_NAME_LEN: usize = 1024;
+
+/// Defence-in-depth cap on wasm bytecode length accepted at the FFI.
+/// Real contracts are <500 KiB; this is ~16× headroom. The Go side
+/// gates contract-deploy size upstream — this cap exists so a Go-side
+/// bug or future-version drift cannot pass a huge `u32` here and have
+/// it become a multi-GiB slice descriptor over uncertain memory. See
+/// issues/ISSUE-024.
+const MAX_WASM_BYTES_LEN: u32 = 8 * 1024 * 1024;
 
 /// Reads a bounded null-terminated C string and validates UTF-8.
 ///
@@ -69,35 +77,130 @@ pub struct vm_exec_instance_t;
 #[repr(C)]
 pub struct vm_exec_compilation_options_t;
 
+struct InstanceOperationGate {
+    state: Mutex<InstanceOperationState>,
+    available: Condvar,
+}
+
+#[derive(Default)]
+struct InstanceOperationState {
+    owner: Option<ThreadId>,
+    depth: usize,
+}
+
+impl InstanceOperationGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InstanceOperationState::default()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn enter(&self) -> InstanceOperationGuard<'_> {
+        let current = thread::current().id();
+        let mut state = self
+            .state
+            .lock()
+            .expect("CapiInstance operation gate mutex poisoned");
+
+        loop {
+            match state.owner {
+                None => {
+                    state.owner = Some(current);
+                    state.depth = 1;
+                    break;
+                }
+                Some(owner) if owner == current => {
+                    state.depth += 1;
+                    break;
+                }
+                Some(_) => {
+                    state = self
+                        .available
+                        .wait(state)
+                        .expect("CapiInstance operation gate mutex poisoned");
+                }
+            }
+        }
+
+        InstanceOperationGuard {
+            gate: self,
+            owner: current,
+        }
+    }
+}
+
+struct InstanceOperationGuard<'a> {
+    gate: &'a InstanceOperationGate,
+    owner: ThreadId,
+}
+
+impl Drop for InstanceOperationGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .expect("CapiInstance operation gate mutex poisoned");
+
+        debug_assert_eq!(state.owner, Some(self.owner));
+        debug_assert!(state.depth > 0);
+
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.owner = None;
+            self.gate.available.notify_all();
+        }
+    }
+}
+
+// The handle registry stores `Arc<CapiInstance>` so in-flight C-API
+// calls keep an instance alive even when another thread destroys the
+// handle. That solves lifetime/UAF, but it also means concurrent callers
+// can reach the same instance. `WasmerInstance` is not generally
+// thread-safe: it contains `RefCell<Option<VMHooksEarlyExit>>` and uses
+// unchecked direct wasm-memory access.
+//
+// The operation gate below serializes all ordinary instance operations
+// while allowing same-thread reentrancy. Same-thread reentrancy is
+// required because `vm_exec_instance_call` can enter wasm, wasm can call
+// a vmhook into Go, and the Go hook can re-enter this C API to read or
+// write wasm memory. A plain `Mutex<Box<dyn InstanceLegacy>>` deadlocks
+// on that legitimate callback path.
+//
+// Breakpoint get/set are intentionally outside this gate: mx-chain-vm-go
+// uses `set_breakpoint_value` from the parent timeout goroutine to
+// interrupt wasm executing in the child goroutine. Blocking that call on
+// the operation gate would break timeout cancellation. The remaining
+// soundness requirement is therefore narrow and explicit: the breakpoint
+// storage itself must be made truly cross-thread safe (for example by an
+// atomic breakpoint mechanism in the Wasmer fork / middleware). Until
+// that lands, the gate prevents accidental concurrent access to the
+// non-interrupt instance operations, but it is not a complete proof of
+// breakpoint interrupt soundness.
 pub struct CapiInstance {
     pub(crate) content: Box<dyn InstanceLegacy>,
-    /// Race-protection flag for `vm_exec_instance_destroy`.
-    ///
-    /// **What this protects against:** two threads calling
-    /// `vm_exec_instance_destroy` concurrently on the same pointer
-    /// *before* `Box::from_raw` has run. `compare_exchange` with
-    /// `Ordering::AcqRel` ensures only one thread wins the race to
-    /// reclaim the Box; the loser observes `destroyed == true` and
-    /// returns without touching the allocation.
-    ///
-    /// **What this does NOT protect against** (audit re-validation
-    /// correctly downgraded this to "Mostly Fixed / Not Confirmed
-    /// Closed"): a *second* destroy call from a *single thread*
-    /// after the first destroy has completed. The first destroy
-    /// frees the allocation via `Box::from_raw`. The second destroy
-    /// then reads the flag through `&*(instance_ptr as *const ...)`
-    /// — but that read dereferences freed memory, which is
-    /// undefined behaviour regardless of what value happens to be
-    /// observed. The atomic flag *requires* the memory to still be
-    /// valid to be read.
-    ///
-    /// A complete close requires the handle-based API redesign
-    /// (audit Open Finding #3) where instance "pointers" become
-    /// `CapiInstanceId(u64)` indices into a generation-counter pool
-    /// validated by the runtime before each dereference. That is
-    /// tracked as separate future work.
-    pub(crate) destroyed: AtomicBool,
+    operation_gate: InstanceOperationGate,
 }
+
+impl CapiInstance {
+    pub(crate) fn new(content: Box<dyn InstanceLegacy>) -> Self {
+        Self {
+            content,
+            operation_gate: InstanceOperationGate::new(),
+        }
+    }
+
+    pub(crate) fn enter_operation(&self) -> impl Drop + '_ {
+        self.operation_gate.enter()
+    }
+}
+
+// Safety invariant: ordinary instance entry points must hold
+// `enter_operation()` before touching `content`. Breakpoint get/set are
+// the only cross-thread interrupt exception and must remain narrow.
+unsafe impl Send for CapiInstance {}
+unsafe impl Sync for CapiInstance {}
 
 /// Creates a new VM executor instance.
 ///
@@ -116,29 +219,60 @@ pub unsafe extern "C" fn vm_exec_new_instance(
     wasm_bytes_len: u32,
     options_ptr: *const vm_exec_compilation_options_t,
 ) -> vm_exec_result_t {
-    let capi_executor = cast_input_ptr!(executor_ptr, CapiExecutor, "executor ptr is null");
+    let capi_executor = cast_capi_executor_ptr!(executor_ptr);
+
+    // ISSUE-040: previously the success path wrote `*instance_ptr_ptr`
+    // without ever validating that out-param. A null out-param crashed
+    // the process on a successful construct. Check up-front so the
+    // constructor is symmetric with ISSUE-006's cache out-param checks.
+    return_if_ptr_null!(instance_ptr_ptr, "instance out-param is null");
 
     if wasm_bytes_ptr.is_null() {
         with_service(|service| service.update_last_error_str("wasm bytes ptr is null".to_string()));
         return vm_exec_result_t::VM_EXEC_ERROR;
     }
 
+    if wasm_bytes_len > MAX_WASM_BYTES_LEN {
+        with_service(|service| {
+            service.update_last_error_str(format!(
+                "wasm bytes length {wasm_bytes_len} exceeds maximum {MAX_WASM_BYTES_LEN}"
+            ))
+        });
+        return vm_exec_result_t::VM_EXEC_ERROR;
+    }
+
     let wasm_bytes: &[u8] =
         unsafe { slice::from_raw_parts(wasm_bytes_ptr, wasm_bytes_len as usize) };
-    let compilation_options: &CompilationOptionsLegacy =
-        unsafe { &*(options_ptr as *const CompilationOptionsLegacy) };
-    let instance_result = capi_executor
-        .content
-        .new_instance(wasm_bytes, compilation_options);
+    // ISSUE-005 (post-validation): use cast_input_const_ptr! so the
+    // options_ptr gets BOTH a null-check AND an alignment-check before
+    // we deref it as &CompilationOptionsLegacy. The previous fix only
+    // null-checked via return_if_ptr_null!, which left the subsequent
+    // raw-pointer cast as UB on a misaligned pointer.
+    let compilation_options: &CompilationOptionsLegacy = cast_input_const_ptr!(
+        options_ptr,
+        CompilationOptionsLegacy,
+        "compilation options ptr is null"
+    );
+    // ISSUE-001 closure: lock the executor's content Mutex; new_instance
+    // is &self so a read-or-write lock both work — Mutex gives us
+    // serial access regardless.
+    let instance_result = {
+        let content_guard = capi_executor
+            .content
+            .lock()
+            .expect("CapiExecutor.content mutex poisoned");
+        content_guard.new_instance(wasm_bytes, compilation_options)
+    };
     match instance_result {
         Ok(instance_box) => {
-            let capi_instance = CapiInstance {
-                content: instance_box,
-                destroyed: AtomicBool::new(false),
-            };
+            let capi_instance = CapiInstance::new(instance_box);
+            // ISSUE-001 closure: register in the typed handle registry;
+            // the returned u64 ID is reinterpreted as a *mut vm_exec_instance_t
+            // for FFI wire compatibility.
+            let id = handle_registry::register_instance(capi_instance);
+            let raw = id as *mut vm_exec_instance_t;
             unsafe {
-                *instance_ptr_ptr =
-                    Box::into_raw(Box::new(capi_instance)) as *mut vm_exec_instance_t;
+                *instance_ptr_ptr = raw;
             }
             vm_exec_result_t::VM_EXEC_OK
         }
@@ -188,6 +322,7 @@ pub unsafe extern "C" fn vm_exec_instance_call(
         }
     };
 
+    let _operation_guard = capi_instance.enter_operation();
     let result = capi_instance.content.call(func_name_r);
     match result {
         Ok(()) => vm_exec_result_t::VM_EXEC_OK,
@@ -212,6 +347,7 @@ pub unsafe extern "C" fn vm_check_signatures(
     instance_ptr: *mut vm_exec_instance_t,
 ) -> vm_exec_result_t {
     let capi_instance = cast_capi_instance_ptr!(instance_ptr);
+    let _operation_guard = capi_instance.enter_operation();
     if capi_instance.content.check_signatures() {
         vm_exec_result_t::VM_EXEC_OK
     } else {
@@ -248,6 +384,7 @@ pub unsafe extern "C" fn vm_exec_instance_has_function(
         }
     };
 
+    let _operation_guard = capi_instance.enter_operation();
     c_int::from(capi_instance.content.has_function(func_name_r))
 }
 
@@ -275,6 +412,7 @@ pub unsafe extern "C" fn vm_exec_instance_has_imported_function(
         }
     };
 
+    let _operation_guard = capi_instance.enter_operation();
     c_int::from(capi_instance.content.has_imported_function(func_name_r))
 }
 
@@ -289,14 +427,41 @@ pub unsafe extern "C" fn vm_exec_instance_has_imported_function(
 pub unsafe extern "C" fn vm_exported_function_names_length(
     instance_ptr: *mut vm_exec_instance_t,
 ) -> c_int {
-    let capi_instance = cast_capi_instance_ptr!(instance_ptr, 0);
+    let capi_instance = cast_capi_instance_ptr!(instance_ptr, -1);
 
+    let _operation_guard = capi_instance.enter_operation();
     let func_names = capi_instance.content.get_exported_function_names();
     if func_names.is_empty() {
-        0
-    } else {
-        let len_sum: usize = func_names.iter().map(|func_name| func_name.len()).sum();
-        c_int::try_from(len_sum + func_names.len()).unwrap_or(0)
+        return 0;
+    }
+    // ISSUE-008: previously `unwrap_or(0)` conflated overflow (huge sum
+    // that doesn't fit c_int) with the empty-list case (legitimate 0).
+    // The Go caller then allocated a 0-length buffer and the subsequent
+    // names-write would overflow it. Now: 0 means "empty list", -1
+    // means "error" (overflow OR null instance). The Go side must
+    // bail on -1 before any allocation. See wasmer2Instance.go:158.
+    let len_sum: usize = func_names.iter().map(|func_name| func_name.len()).sum();
+    let total = match len_sum.checked_add(func_names.len()) {
+        Some(t) => t,
+        None => {
+            with_service(|service| {
+                service.update_last_error_str(
+                    "exported function names total length overflows usize".to_string(),
+                )
+            });
+            return -1;
+        }
+    };
+    match c_int::try_from(total) {
+        Ok(n) => n,
+        Err(_) => {
+            with_service(|service| {
+                service.update_last_error_str(format!(
+                    "exported function names total length {total} does not fit in c_int"
+                ))
+            });
+            -1
+        }
     }
 }
 
@@ -321,6 +486,7 @@ pub unsafe extern "C" fn vm_exported_function_names(
 ) -> c_int {
     let capi_instance = cast_capi_instance_ptr!(instance_ptr, 0);
 
+    let _operation_guard = capi_instance.enter_operation();
     let func_names = capi_instance.content.get_exported_function_names();
     let concat = func_names.join("|");
     unsafe { string_copy(concat, dest_buffer, dest_buffer_len) }
@@ -342,40 +508,21 @@ pub unsafe extern "C" fn vm_exec_instance_destroy(instance_ptr: *mut vm_exec_ins
     if instance_ptr.is_null() {
         return;
     }
-    // SAFETY contract — race-protection, NOT stale-pointer-protection.
-    //
-    // The Acquire load below works correctly only when the
-    // CapiInstance allocation is still live (i.e. the first destroy
-    // has either not happened yet or is racing this one). It does
-    // NOT protect a second destroy from a single thread after the
-    // first destroy has completed: by then the allocation has been
-    // reclaimed by Box::from_raw and the read on the next line is
-    // undefined behaviour regardless of what the freed memory still
-    // contains.
-    //
-    // Acceptable usage contract for the Go-side caller:
-    //   - Concurrent destroys from multiple goroutines on the same
-    //     pointer are safe; only one wins the cmpxchg and reclaims.
-    //   - A single thread must never call destroy twice on the same
-    //     pointer. The destroyed flag does not (and structurally
-    //     cannot) protect that case.
-    //
-    // The complete fix is the handle-based API redesign tracked as
-    // audit Open Finding #3. See the CapiInstance::destroyed field
-    // doc-comment for details.
-    let inst_ref = unsafe { &*(instance_ptr as *const CapiInstance) };
-    if inst_ref
-        .destroyed
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        // Already destroyed (or being destroyed concurrently). Do
-        // nothing — the first caller wins the race and owns the
-        // reclamation.
-        return;
-    }
-    let instance = unsafe { Box::from_raw(instance_ptr as *mut CapiInstance) };
-    drop(instance);
+    // ISSUE-001 closure: the "pointer" is now an opaque ID into the
+    // typed handle registry. See the equivalent comment block in
+    // vm_exec_executor_destroy for the full rationale. Short version:
+    //   - Reading at the address would be wild — IDs are small ints,
+    //     not real pointers.
+    //   - The registry's HashMap::remove drops the registry's strong
+    //     Arc reference; the underlying CapiInstance is freed when
+    //     the LAST Arc drops, which is guaranteed safe even if a
+    //     concurrent caller holds a clone (their call completes
+    //     against a still-alive instance, then the Arc drops).
+    //   - Double-destroy of an unknown ID returns false silently;
+    //     no UAF possible because there was nothing at that address
+    //     to free.
+    let id = instance_ptr as u64;
+    let _removed = handle_registry::destroy_instance(id);
 }
 
 /// Resets an instance, cleaning memories and globals.
@@ -391,6 +538,7 @@ pub unsafe extern "C" fn vm_exec_instance_reset(
 ) -> vm_exec_result_t {
     let capi_instance = cast_capi_instance_ptr!(instance_ptr);
 
+    let _operation_guard = capi_instance.enter_operation();
     let result = capi_instance.content.reset();
     match result {
         Ok(()) => vm_exec_result_t::VM_EXEC_OK,
@@ -484,15 +632,54 @@ mod tests {
     }
 
     fn new_mock_instance_ptr() -> *mut vm_exec_instance_t {
-        Box::into_raw(Box::new(CapiInstance {
-            content: Box::new(MockInstance),
-            destroyed: AtomicBool::new(false),
-        })) as *mut vm_exec_instance_t
+        // Mirror what vm_exec_new_instance does on the production path:
+        // register the CapiInstance in the typed handle registry, get
+        // the u64 ID, reinterpret as *mut vm_exec_instance_t for the
+        // FFI wire shape. vm_exec_instance_destroy in the test cleanup
+        // will route through handle_registry::destroy_instance.
+        let id = handle_registry::register_instance(CapiInstance::new(Box::new(MockInstance)));
+        id as *mut vm_exec_instance_t
     }
 
     fn assert_invalid_utf8_error() {
         let last_error = with_service(|service| service.get_last_error_string());
         assert!(last_error.starts_with("invalid function name utf-8:"));
+    }
+
+    #[test]
+    fn instance_operation_gate_allows_same_thread_reentry() {
+        let instance = CapiInstance::new(Box::new(MockInstance));
+
+        let _outer = instance.enter_operation();
+        let _inner = instance.enter_operation();
+    }
+
+    #[test]
+    fn instance_operation_gate_serializes_cross_thread_entries() {
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let instance = Arc::new(CapiInstance::new(Box::new(MockInstance)));
+        let outer = instance.enter_operation();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let other_instance = Arc::clone(&instance);
+        let handle = std::thread::spawn(move || {
+            let _guard = other_instance.enter_operation();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        assert!(entered_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(outer);
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cross-thread operation did not enter after owner released gate");
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -506,6 +693,48 @@ mod tests {
 
         assert_eq!(result, -1);
         assert_invalid_utf8_error();
+        unsafe { vm_exec_instance_destroy(instance_ptr) };
+    }
+
+    /// ISSUE-001 closure smoke test. Build an instance, destroy it,
+    /// then attempt a normal C-API operation on the now-stale ID. The
+    /// operation must NOT touch any freed memory (the registry returns
+    /// `None` for an unknown ID, the macro short-circuits, the entry
+    /// point returns the error code with a clear last-error string).
+    /// This is the case the previous pointer-liveness defenses couldn't
+    /// fully close — the test passes here because IDs are never reused.
+    #[test]
+    fn use_after_destroy_returns_clean_error_not_uaf() {
+        let instance_ptr = new_mock_instance_ptr();
+        // Round-trip through destroy first.
+        unsafe { vm_exec_instance_destroy(instance_ptr) };
+
+        // Now call has_function on the destroyed ID. The macro should
+        // see the ID is no longer in the registry and return -1 with
+        // a stale-ID error message — NOT crash, NOT read freed memory.
+        let func_name = b"any\0";
+        let result = unsafe {
+            vm_exec_instance_has_function(instance_ptr, func_name.as_ptr() as *const c_char)
+        };
+        assert_eq!(result, -1);
+        let last_error = with_service(|service| service.get_last_error_string());
+        assert!(
+            last_error.contains("not found in registry"),
+            "expected stale-ID error, got: {:?}",
+            last_error
+        );
+    }
+
+    /// Double-destroy of the same ID is a safe no-op. Previously this
+    /// could trigger a heap double-free under specific allocator
+    /// timing; now the registry's HashMap::remove returns false on the
+    /// second call and the destroy function is a no-op.
+    #[test]
+    fn double_destroy_same_id_is_safe_no_op() {
+        let instance_ptr = new_mock_instance_ptr();
+        unsafe { vm_exec_instance_destroy(instance_ptr) };
+        // Must not crash, must not corrupt anything.
+        unsafe { vm_exec_instance_destroy(instance_ptr) };
         unsafe { vm_exec_instance_destroy(instance_ptr) };
     }
 

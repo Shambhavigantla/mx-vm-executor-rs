@@ -11,12 +11,17 @@ use crate::{
 use log::trace;
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use wasmer::{CompilerConfig, Extern, Module, Store};
 use wasmer::{ExternType, Universal};
 use wasmer::{Pages, Singlepass};
 
 const MAX_MEMORY_PAGES_ALLOWED: Pages = Pages(20);
+const MEMORY_RANGE_NEGATIVE_OFFSET: &str = "memory range has negative offset";
+const MEMORY_RANGE_NEGATIVE_LENGTH: &str = "memory range has negative length";
+const MEMORY_RANGE_OVERFLOW: &str = "memory range overflows";
+const MEMORY_RANGE_OUT_OF_BOUNDS: &str = "memory range out of bounds";
 
 pub struct WasmerInstance {
     pub(crate) wasmer_instance: wasmer::Instance,
@@ -177,6 +182,34 @@ fn validate_memory(memory: &wasmer::Memory) -> Result<(), ExecutorError> {
     Ok(())
 }
 
+fn checked_memory_range(
+    mem_ptr: MemPtr,
+    mem_length: MemLength,
+    memory_len: usize,
+) -> Result<Range<usize>, ExecutorError> {
+    let start = usize::try_from(mem_ptr)
+        .map_err(|_| Box::new(ServiceError::new(MEMORY_RANGE_NEGATIVE_OFFSET)))?;
+    let length = usize::try_from(mem_length)
+        .map_err(|_| Box::new(ServiceError::new(MEMORY_RANGE_NEGATIVE_LENGTH)))?;
+    checked_memory_range_from_usize(start, length, memory_len)
+}
+
+fn checked_memory_range_from_usize(
+    start: usize,
+    length: usize,
+    memory_len: usize,
+) -> Result<Range<usize>, ExecutorError> {
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| Box::new(ServiceError::new(MEMORY_RANGE_OVERFLOW)))?;
+
+    if end > memory_len {
+        return Err(Box::new(ServiceError::new(MEMORY_RANGE_OUT_OF_BOUNDS)));
+    }
+
+    Ok(start..end)
+}
+
 fn push_middlewares(
     compiler: &mut Singlepass,
     compilation_options: &CompilationOptionsLegacy,
@@ -320,9 +353,8 @@ impl InstanceLegacy for WasmerInstance {
         match result {
             Ok(memory) => unsafe {
                 let mem_data = memory.data_unchecked();
-                let start = mem_ptr as usize;
-                let end = (mem_ptr + mem_length) as usize;
-                Ok(&mem_data[start..end])
+                let range = checked_memory_range(mem_ptr, mem_length, mem_data.len())?;
+                Ok(&mem_data[range])
             },
             Err(err) => Err(err.into()),
         }
@@ -333,7 +365,10 @@ impl InstanceLegacy for WasmerInstance {
         match result {
             Ok(memory) => unsafe {
                 let mem_data = memory.data_unchecked_mut();
-                mem_data[mem_ptr as usize..mem_ptr as usize + data.len()].copy_from_slice(data);
+                let start = usize::try_from(mem_ptr)
+                    .map_err(|_| Box::new(ServiceError::new(MEMORY_RANGE_NEGATIVE_OFFSET)))?;
+                let range = checked_memory_range_from_usize(start, data.len(), mem_data.len())?;
+                mem_data[range].copy_from_slice(data);
                 Ok(())
             },
             Err(err) => Err(err.into()),
@@ -369,6 +404,36 @@ impl InstanceLegacy for WasmerInstance {
             Ok(bytes) => Ok(bytes),
             Err(err) => Err(err.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_memory_range_accepts_in_bounds_range() {
+        assert_eq!(checked_memory_range(2, 3, 8).unwrap(), 2..5);
+    }
+
+    #[test]
+    fn checked_memory_range_rejects_negative_offset() {
+        assert!(checked_memory_range(-1, 1, 8).is_err());
+    }
+
+    #[test]
+    fn checked_memory_range_rejects_negative_length() {
+        assert!(checked_memory_range(1, -1, 8).is_err());
+    }
+
+    #[test]
+    fn checked_memory_range_rejects_overflow() {
+        assert!(checked_memory_range_from_usize(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn checked_memory_range_rejects_out_of_bounds_range() {
+        assert!(checked_memory_range(6, 3, 8).is_err());
     }
 }
 
